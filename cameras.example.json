@@ -1,0 +1,4 @@
+[
+  { "id": "cam1", "name": "Ejemplo Cámara Principal", "ip": "192.168.1.100", "user": "admin", "pass": "TuPasswordSeguro123", "channel": "102" },
+  { "id": "cam2", "name": "Ejemplo Cámara Secundaria", "ip": "192.168.1.101", "user": "admin", "pass": "TuPasswordSeguro123", "channel": "102" }
+]
