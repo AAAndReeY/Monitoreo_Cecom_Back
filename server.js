@@ -108,7 +108,7 @@ app.post('/api/stream/start/:id', (req, res) => {
       wsPort: wsPort,
       ffmpegOptions: channel === 102
         ? { '-stats': '', '-r': 25, '-q:v': 3 }
-        : { '-stats': '', '-r': 15, '-q:v': 7, '-vf': 'scale=640:360' }
+        : { '-stats': '', '-r': 25, '-q:v': 3, '-s': '704x480' }
     });
 
     activeStreams[streamKey] = { stream, wsPort };
