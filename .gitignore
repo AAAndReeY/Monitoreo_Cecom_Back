@@ -1,3 +1,6 @@
 node_modules/
 cameras.json
 .env
+probe.js
+camaras.xlsx
+~$camaras.xlsx

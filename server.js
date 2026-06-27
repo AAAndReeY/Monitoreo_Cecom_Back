@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -8,13 +10,12 @@ const ffmpeg = require('ffmpeg-static');
 // Ensure node-rtsp-stream uses our local ffmpeg binary
 process.env.PATH = path.dirname(ffmpeg) + path.delimiter + process.env.PATH;
 
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 3001;
-const BASE_WS_PORT = 9900; // WebSocket ports will start from here
+const PORT         = process.env.PORT         || 3001;
+const BASE_WS_PORT = process.env.BASE_WS_PORT || 9900;
 
 // Load cameras from JSON
 const camerasPath = path.join(__dirname, 'cameras.json');
@@ -25,13 +26,24 @@ try {
   console.error("Error reading cameras.json", e);
 }
 
-// Store active streams
-// { camId: { stream: StreamInstance, wsPort: number } }
+// Load probe results (channel discovery)
+let probeChannels = {};
+try {
+  const probe = JSON.parse(fs.readFileSync(path.join(__dirname, 'probe-result.json'), 'utf8'));
+  for (const r of probe) probeChannels[r.id] = r.channels || [];
+} catch {}
+
+// Store active streams keyed as "camId:channel"
 const activeStreams = {};
 
-// Get list of cameras
+// Get list of cameras (includes available channels from probe)
 app.get('/api/cameras', (req, res) => {
-  res.json(cameras.map(c => ({ id: c.id, name: c.name }))); // Don't expose RTSP URLs
+  res.json(cameras.map(c => ({
+    id: c.id,
+    name: c.name,
+    zone: c.zone,
+    channels: probeChannels[c.id]?.length ? probeChannels[c.id] : [parseInt(c.channel) || 102],
+  })));
 });
 
 // PTZ Control
@@ -73,44 +85,36 @@ app.post('/api/ptz/:id', async (req, res) => {
 app.post('/api/stream/start/:id', (req, res) => {
   const camId = req.params.id;
   const camera = cameras.find(c => c.id === camId);
-  
-  if (!camera) {
-    return res.status(404).json({ error: 'Camera not found' });
+  if (!camera) return res.status(404).json({ error: 'Camera not found' });
+
+  const channel = req.body?.channel || parseInt(camera.channel) || 102;
+  const streamKey = `${camId}:${channel}`;
+  const rtspUrl = `rtsp://${camera.user}:${camera.pass}@${camera.ip}:554/Streaming/Channels/${channel}`;
+
+  if (activeStreams[streamKey]) {
+    return res.json({ wsPort: activeStreams[streamKey].wsPort });
   }
 
-  // Build RTSP URL dynamically
-  const rtspUrl = `rtsp://${camera.user}:${camera.pass}@${camera.ip}:554/Streaming/Channels/${camera.channel}`;
-
-  // If already active, return the existing port
-  if (activeStreams[camId]) {
-    return res.json({ wsPort: activeStreams[camId].wsPort });
-  }
-
-  // Assign a free port
   const usedPorts = Object.values(activeStreams).map(s => s.wsPort);
   let wsPort = BASE_WS_PORT;
-  while (usedPorts.includes(wsPort)) {
-    wsPort++;
-  }
+  while (usedPorts.includes(wsPort)) wsPort++;
 
-  console.log(`Starting stream for ${camId} on port ${wsPort} with IP: ${camera.ip}`);
+  console.log(`Starting stream for ${streamKey} on port ${wsPort}`);
 
   try {
     const stream = new Stream({
-      name: camId,
+      name: streamKey,
       streamUrl: rtspUrl,
       wsPort: wsPort,
-      ffmpegOptions: { // Options for FFmpeg
-        '-stats': '', 
-        '-r': 30, // MPEG-1 requires standard framerates like 30
-        '-q:v': 5 // Quality (1-31, lower is better)
-      }
+      ffmpegOptions: channel === 102
+        ? { '-stats': '', '-r': 25, '-q:v': 3 }
+        : { '-stats': '', '-r': 25, '-q:v': 3, '-s': '704x480' }
     });
 
-    activeStreams[camId] = { stream, wsPort };
+    activeStreams[streamKey] = { stream, wsPort };
     res.json({ wsPort });
   } catch (error) {
-    console.error(`Error starting stream for ${camId}:`, error);
+    console.error(`Error starting stream for ${streamKey}:`, error);
     res.status(500).json({ error: 'Failed to start stream' });
   }
 });
@@ -118,15 +122,17 @@ app.post('/api/stream/start/:id', (req, res) => {
 // Stop a stream
 app.post('/api/stream/stop/:id', (req, res) => {
   const camId = req.params.id;
-  
-  if (activeStreams[camId]) {
-    console.log(`Stopping stream for ${camId}`);
-    activeStreams[camId].stream.stop();
-    delete activeStreams[camId];
-    return res.json({ success: true });
+  const channel = req.body?.channel;
+  const streamKey = channel ? `${camId}:${channel}` : camId;
+
+  // Try keyed form first, then legacy bare camId
+  const key = activeStreams[streamKey] ? streamKey : (activeStreams[camId] ? camId : null);
+  if (key) {
+    console.log(`Stopping stream for ${key}`);
+    activeStreams[key].stream.stop();
+    delete activeStreams[key];
   }
-  
-  res.json({ success: true, message: 'Stream was not active' });
+  res.json({ success: true });
 });
 
 // Start a playback stream
@@ -178,12 +184,14 @@ app.post('/api/stream/playback/:id', (req, res) => {
 
   // Assign a free port starting from a higher range to avoid conflict with live views
   const usedPorts = Object.values(activeStreams).map(s => s.wsPort);
-  let wsPort = BASE_WS_PORT + 100; 
+  let wsPort = BASE_WS_PORT + 100;
   while (usedPorts.includes(wsPort)) {
     wsPort++;
   }
 
-  console.log(`Starting playback for ${camId} on port ${wsPort} from ${starttime}`);
+  const maskedUrl = rtspUrl.replace(`:${playPass}@`, ':***@');
+  console.log(`[PLAYBACK] camId=${camId} port=${wsPort}`);
+  console.log(`[PLAYBACK] URL: ${maskedUrl}`);
 
   try {
     const stream = new Stream({
