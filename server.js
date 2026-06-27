@@ -92,6 +92,7 @@ app.post('/api/stream/start/:id', (req, res) => {
   const rtspUrl = `rtsp://${camera.user}:${camera.pass}@${camera.ip}:554/Streaming/Channels/${channel}`;
 
   if (activeStreams[streamKey]) {
+    activeStreams[streamKey].lastAccessed = Date.now();
     return res.json({ wsPort: activeStreams[streamKey].wsPort });
   }
 
@@ -111,7 +112,7 @@ app.post('/api/stream/start/:id', (req, res) => {
         : { '-stats': '', '-r': 25, '-q:v': 3, '-s': '704x480' }
     });
 
-    activeStreams[streamKey] = { stream, wsPort };
+    activeStreams[streamKey] = { stream, wsPort, lastAccessed: Date.now() };
     res.json({ wsPort });
   } catch (error) {
     console.error(`Error starting stream for ${streamKey}:`, error);
@@ -125,12 +126,20 @@ app.post('/api/stream/stop/:id', (req, res) => {
   const channel = req.body?.channel;
   const streamKey = channel ? `${camId}:${channel}` : camId;
 
-  // Try keyed form first, then legacy bare camId
   const key = activeStreams[streamKey] ? streamKey : (activeStreams[camId] ? camId : null);
   if (key) {
-    console.log(`Stopping stream for ${key}`);
-    activeStreams[key].stream.stop();
-    delete activeStreams[key];
+    // Wait for the websocket to disconnect before checking client count
+    setTimeout(() => {
+      if (activeStreams[key]) {
+        const clients = activeStreams[key].stream.wsServer?.clients;
+        const count = clients ? (clients.size !== undefined ? clients.size : clients.length) : 0;
+        if (count === 0) {
+          console.log(`Stopping stream for ${key} (0 clients connected)`);
+          activeStreams[key].stream.stop();
+          delete activeStreams[key];
+        }
+      }
+    }, 3000);
   }
   res.json({ success: true });
 });
@@ -206,7 +215,7 @@ app.post('/api/stream/playback/:id', (req, res) => {
       }
     });
 
-    activeStreams[`playback_${camId}`] = { stream, wsPort };
+    activeStreams[`playback_${camId}`] = { stream, wsPort, lastAccessed: Date.now() };
     res.json({ wsPort });
   } catch (error) {
     console.error(`Error starting playback for ${camId}:`, error);
@@ -224,6 +233,20 @@ app.post('/api/stream/playback/stop/:id', (req, res) => {
   }
   res.json({ success: true });
 });
+
+// Auto-cleanup idle streams every 15 seconds
+setInterval(() => {
+  for (const [key, data] of Object.entries(activeStreams)) {
+    if (Date.now() - data.lastAccessed < 15000) continue; // 15s grace period
+    const clients = data.stream.wsServer?.clients;
+    const count = clients ? (clients.size !== undefined ? clients.size : clients.length) : 0;
+    if (count === 0) {
+      console.log(`Auto-cleaning idle stream ${key}`);
+      data.stream.stop();
+      delete activeStreams[key];
+    }
+  }
+}, 15000);
 
 app.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
