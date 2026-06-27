@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -8,13 +10,12 @@ const ffmpeg = require('ffmpeg-static');
 // Ensure node-rtsp-stream uses our local ffmpeg binary
 process.env.PATH = path.dirname(ffmpeg) + path.delimiter + process.env.PATH;
 
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = 3001;
-const BASE_WS_PORT = 9900; // WebSocket ports will start from here
+const PORT         = process.env.PORT         || 3001;
+const BASE_WS_PORT = process.env.BASE_WS_PORT || 9900;
 
 // Load cameras from JSON
 const camerasPath = path.join(__dirname, 'cameras.json');
