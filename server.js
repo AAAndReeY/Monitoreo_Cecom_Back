@@ -112,7 +112,22 @@ app.post('/api/stream/start/:id', (req, res) => {
         : { '-stats': '', '-r': 25, '-q:v': 3, '-s': '704x480' }
     });
 
-    activeStreams[streamKey] = { stream, wsPort, lastAccessed: Date.now() };
+    activeStreams[streamKey] = { stream, wsPort, startedAt: Date.now() };
+
+    // Auto-stop when last WebSocket client disconnects
+    stream.wsServer.on('connection', (ws) => {
+      ws.on('close', () => {
+        setTimeout(() => {
+          if (!activeStreams[streamKey]) return;
+          if (activeStreams[streamKey].stream.wsServer.clients.size === 0) {
+            console.log(`No clients left for ${streamKey}, stopping stream`);
+            activeStreams[streamKey].stream.stop();
+            delete activeStreams[streamKey];
+          }
+        }, 5000); // 5s grace period before killing
+      });
+    });
+
     res.json({ wsPort });
   } catch (error) {
     console.error(`Error starting stream for ${streamKey}:`, error);
@@ -247,6 +262,28 @@ setInterval(() => {
     }
   }
 }, 15000);
+
+// Periodic cleanup: kill streams with no connected clients (safety net)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of Object.entries(activeStreams)) {
+    const clients = entry.stream.wsServer?.clients?.size ?? 0;
+    const ageHours = (now - entry.startedAt) / 3600000;
+    if (clients === 0 || ageHours > 4) {
+      console.log(`[cleanup] Stopping idle/stale stream: ${key} (clients=${clients}, age=${ageHours.toFixed(1)}h)`);
+      try { entry.stream.stop(); } catch {}
+      delete activeStreams[key];
+    }
+  }
+}, 10 * 60 * 1000); // every 10 minutes
+
+// Prevent unhandled rejections from crashing the process
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
 
 app.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
