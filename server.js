@@ -92,6 +92,7 @@ app.post('/api/stream/start/:id', (req, res) => {
   const rtspUrl = `rtsp://${camera.user}:${camera.pass}@${camera.ip}:554/Streaming/Channels/${channel}`;
 
   if (activeStreams[streamKey]) {
+    activeStreams[streamKey].lastAccessed = Date.now();
     return res.json({ wsPort: activeStreams[streamKey].wsPort });
   }
 
@@ -107,11 +108,26 @@ app.post('/api/stream/start/:id', (req, res) => {
       streamUrl: rtspUrl,
       wsPort: wsPort,
       ffmpegOptions: channel === 102
-        ? { '-stats': '', '-r': 25, '-q:v': 3 }
-        : { '-stats': '', '-r': 25, '-q:v': 3, '-s': '704x480' }
+        ? { '-rtsp_transport': 'tcp', '-stats': '', '-r': 25, '-q:v': 3 }
+        : { '-rtsp_transport': 'tcp', '-stats': '', '-r': 25, '-q:v': 3, '-s': '704x480' }
     });
 
-    activeStreams[streamKey] = { stream, wsPort };
+    activeStreams[streamKey] = { stream, wsPort, startedAt: Date.now() };
+
+    // Auto-stop when last WebSocket client disconnects
+    stream.wsServer.on('connection', (ws) => {
+      ws.on('close', () => {
+        setTimeout(() => {
+          if (!activeStreams[streamKey]) return;
+          if (activeStreams[streamKey].stream.wsServer.clients.size === 0) {
+            console.log(`No clients left for ${streamKey}, stopping stream`);
+            activeStreams[streamKey].stream.stop();
+            delete activeStreams[streamKey];
+          }
+        }, 5000); // 5s grace period before killing
+      });
+    });
+
     res.json({ wsPort });
   } catch (error) {
     console.error(`Error starting stream for ${streamKey}:`, error);
@@ -125,12 +141,20 @@ app.post('/api/stream/stop/:id', (req, res) => {
   const channel = req.body?.channel;
   const streamKey = channel ? `${camId}:${channel}` : camId;
 
-  // Try keyed form first, then legacy bare camId
   const key = activeStreams[streamKey] ? streamKey : (activeStreams[camId] ? camId : null);
   if (key) {
-    console.log(`Stopping stream for ${key}`);
-    activeStreams[key].stream.stop();
-    delete activeStreams[key];
+    // Wait for the websocket to disconnect before checking client count
+    setTimeout(() => {
+      if (activeStreams[key]) {
+        const clients = activeStreams[key].stream.wsServer?.clients;
+        const count = clients ? (clients.size !== undefined ? clients.size : clients.length) : 0;
+        if (count === 0) {
+          console.log(`Stopping stream for ${key} (0 clients connected)`);
+          activeStreams[key].stream.stop();
+          delete activeStreams[key];
+        }
+      }
+    }, 3000);
   }
   res.json({ success: true });
 });
@@ -206,7 +230,7 @@ app.post('/api/stream/playback/:id', (req, res) => {
       }
     });
 
-    activeStreams[`playback_${camId}`] = { stream, wsPort };
+    activeStreams[`playback_${camId}`] = { stream, wsPort, lastAccessed: Date.now() };
     res.json({ wsPort });
   } catch (error) {
     console.error(`Error starting playback for ${camId}:`, error);
@@ -223,6 +247,42 @@ app.post('/api/stream/playback/stop/:id', (req, res) => {
     console.log(`Stopped playback for ${camId}`);
   }
   res.json({ success: true });
+});
+
+// Auto-cleanup idle streams every 15 seconds
+setInterval(() => {
+  for (const [key, data] of Object.entries(activeStreams)) {
+    if (Date.now() - data.lastAccessed < 15000) continue; // 15s grace period
+    const clients = data.stream.wsServer?.clients;
+    const count = clients ? (clients.size !== undefined ? clients.size : clients.length) : 0;
+    if (count === 0) {
+      console.log(`Auto-cleaning idle stream ${key}`);
+      data.stream.stop();
+      delete activeStreams[key];
+    }
+  }
+}, 15000);
+
+// Periodic cleanup: kill streams with no connected clients (safety net)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of Object.entries(activeStreams)) {
+    const clients = entry.stream.wsServer?.clients?.size ?? 0;
+    const ageHours = (now - entry.startedAt) / 3600000;
+    if (clients === 0 || ageHours > 4) {
+      console.log(`[cleanup] Stopping idle/stale stream: ${key} (clients=${clients}, age=${ageHours.toFixed(1)}h)`);
+      try { entry.stream.stop(); } catch {}
+      delete activeStreams[key];
+    }
+  }
+}, 10 * 60 * 1000); // every 10 minutes
+
+// Prevent unhandled rejections from crashing the process
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
 });
 
 app.listen(PORT, () => {
